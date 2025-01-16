@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Fluid Simulation</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=620">
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="src/style.css">
+</head>
+<body class="w-screen h-screen flex flex-col bg-gray-100">
+
+    <!-- Header -->
+    <header class="bg-gray-700 text-white p-4 flex items-center justify-between">
+        <h1 class="text-2xl font-bold">Fluid Simulation</h1>
+        <div>
+            <span class="text-sm">Animation speed: <span id="speedReadout">807</span> steps/s</span>
+            <label class="ml-2 text-sm"><input id="rafCheck" type="checkbox" checked> Faster?</label>
+        </div>
+    </header>
+
+    <!-- Main content area -->
+    <div class="flex flex-1 overflow-hidden">
+
+        <!-- Main simulation canvas -->
+        <main class="flex-1 flex flex-col items-center justify-center p-4 overflow-auto">
+            <canvas id="theCanvas" class="border-2 border-gray-500 mb-4 w-3/4 h-1/2"></canvas>
+            
+            <!-- Quick Controls -->
+            <div class="mb-4 flex flex-wrap gap-2">
+                <select id="sizeSelect" class="p-2 border rounded">
+                    <option value="3">200 x 80</option>
+                    <option value="2">300 x 120</option>
+                    <option value="1">600 x 240</option>
+                </select>
+                <input id="resetFluidButton" type="button" value="Reset fluid" class="p-2 border rounded bg-blue-500 text-white">
+                <input id="stepButton" type="button" value="Step" class="p-2 border rounded bg-blue-500 text-white">
+                <input id="startButton" type="button"  value="Pause" class="p-2 border rounded bg-blue-500 text-white">
+            </div>
+
+            <!-- Plot selection and controls -->
+            <div class="mb-4 flex flex-wrap gap-2 items-center">
+                <select id="plotSelect" class="p-2 border rounded">
+                    <option>Plot density</option>
+                    <option>Plot x velocity</option>
+                    <option>Plot y velocity</option>
+                    <option>Plot speed</option>
+                    <option selected>Plot curl</option>
+                </select>
+                <span>Contrast:</span>
+                <input id="contrastSlider" type="range" min="-10" max="10" step="1" value="0" class="p-2">
+            </div>
+        </main>
+
+        <!-- Sidebar controls -->
+        <aside class="w-80 bg-white border-l border-gray-300 p-4 overflow-auto">
+            <!-- Flow and Viscosity Controls -->
+            <div class="mb-4">
+                <div class="mb-2 font-bold">Fluid Parameters</div>
+                <div>Flow speed = <span id="speedValue">0.100</span></div>
+                <input id="speedSlider" type="range" min="0" max="0.12" step="0.005" value="0.1" class="w-full mb-2">
+                <div>Viscosity = <span id="viscValue">0.020</span></div>
+                <input id="viscSlider" type="range" min="0.005" max="0.2" step="0.005" value="0.02" class="w-full">
+            </div>
+
+            <!-- Mouse and Barrier Controls -->
+            <div class="mb-4">
+                <div class="mb-2 font-bold">Barrier & Mouse Controls</div>
+                <select id="mouseSelect" class="mr-2 p-2 border rounded w-full mb-2">
+                    <option value="draw">Draw barriers</option>
+                    <option value="erase">Erase barriers</option>
+                    <option value="push">Drag fluid</option>
+                </select>
+                <select id="barrierSelect" class="mr-2 p-2 border rounded w-full mb-2">
+                    <option>Barrier shapes</option>
+                    <option>Short line</option>
+                    <option>Long line</option>
+                    <option>Diagonal</option>
+                    <option>Shallow diagonal</option>
+                    <option>Small circle</option>
+                    <option>Large circle</option>
+                    <option>Line with spoiler</option>
+                    <option>Circle with spoiler</option>
+                    <option>Right angle</option>
+                    <option>Wedge</option>
+                    <option>Airfoil</option>
+                </select>
+                <input id="clearButton" type="button" value="Clear barriers" class="p-2 border rounded bg-blue-500 text-white w-full">
+            </div>
+
+            <!-- Animation & Visibility -->
+            <div class="mb-4">
+                <div class="mb-2 font-bold">Animation & View</div>
+                <div class="flex items-center justify-between mb-2">
+                    <span>Animation speed:</span>
+                    <input id="stepsSlider" type="range" min="1" max="40" step="1" value="20" class="flex-1 ml-2">
+                </div>
+                <div class="mb-2 flex items-center flex-wrap gap-2 text-sm">
+                    <label><input id="tracerCheck" type="checkbox"> Tracers</label>
+                    <label><input id="flowlineCheck" type="checkbox"> Flowlines</label>
+                    <label><input id="forceCheck" type="checkbox"> Force on barriers</label>
+                    <label><input id="sensorCheck" type="checkbox"> Sensor</label>
+                    <label><input id="dataCheck" type="checkbox"> Data</label>
+                </div>
+            </div>
+
+            <!-- Data Section -->
+            <div id="dataSection" style="display: none;" class="mb-4">
+                <div class="mb-2 font-bold">Data</div>
+                <textarea id="dataArea" rows="8" cols="50" disabled readonly class="p-2 border rounded w-full mb-2"></textarea>
+                <div class="flex flex-wrap gap-2">
+                    <input id="dataButton" type="button" value="Start data collection" class="p-2 border rounded bg-blue-500 text-white">
+                    <input id="periodButton" type="button" value="Show F_y period" class="p-2 border rounded bg-blue-500 text-white">
+                    <input id="barrierDataButton" type="button" value="Show barrier locations" class="p-2 border rounded bg-blue-500 text-white">
+                    <input id="debugButton" type="button" value="Debug" style="display: none;" class="p-2 border rounded bg-blue-500 text-white">
+                </div>
+            </div>
+
+            <!-- Fish Stamina -->
+            <div class="mb-4 p-2 bg-gray-100 border rounded">
+                <div class="font-bold mb-1">Fish Stamina:</div>
+                <span id="fishStamina" class="font-mono">100%</span>
+            </div>
+
+        </aside>
+    </div>
+
+    <!-- Footer (optional) -->
+    <footer class="bg-gray-200 text-gray-700 text-sm p-2 text-center">
+        Fluid Simulation Example | © Your Name
+    </footer>
+
+    <script type="module" src="../src/sim1/main.ts"></script>
+</body>
+</html>

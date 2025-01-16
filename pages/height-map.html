@@ -1,0 +1,629 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<title>3D River Simulation with Water Surface</title>
+<style>
+    body {
+        font-family: Verdana, sans-serif; 
+        font-size: 15px;
+        margin: 0;
+        overflow: hidden;
+    }
+    .button {
+        position: absolute;
+        top: 10px;
+        left: 10px;
+        background-color: #606060;
+        border: none;
+        color: white;
+        padding: 10px 20px;
+        font-size: 14px;
+        margin: 4px 2px;
+        cursor: pointer;
+        z-index: 1;
+        border-radius: 4px;
+        opacity: 0.8;
+    }
+    .button:hover {
+        opacity: 1.0;
+    }
+    #warning {
+        position: absolute;
+        top: 50px;
+        left: 10px;
+        background-color: rgba(255, 0, 0, 0.8);
+        color: white;
+        padding: 10px 20px;
+        border-radius: 4px;
+        z-index: 1;
+        display: none;
+    }
+    #container {
+        width: 100vw;
+        height: 100vh;
+        background-color: skyblue;
+    }
+</style>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+
+<body>
+<!-- <button id="buttonRun" onclick="toggleRun()" class="button">Stop</button>
+<button onclick="restart()" class="button">Restart</button> -->
+<div id="warning">
+    Error: Unable to render water surface with current river dimensions and water spacing. 
+    Please adjust the river size or water spacing.
+</div>
+<div id="container"></div>
+
+<!-- Three.js Library -->
+<script src="https://unpkg.com/three@0.139.2/build/three.min.js"></script>
+<script src="https://unpkg.com/three@0.139.2/examples/js/controls/OrbitControls.js"></script>
+        
+<!-- Water Shaders -->
+<script id="waterVertexShader" type="x-shader/x-vertex">
+    varying vec3 varNormal;
+    varying vec2 varScreenPos;
+    varying vec3 varPos;
+
+    void main() {
+        vec4 pos = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        gl_Position = pos;
+    
+        // Correct computation of screen-space UV
+        varScreenPos = (gl_Position.xy / gl_Position.w) * 0.5 + vec2(0.5);
+    
+        varPos = position;
+        varNormal = normal;
+    }        
+</script>
+
+<script id="waterFragmentShader" type="x-shader/x-fragment">
+    uniform sampler2D background;
+    varying vec3 varNormal;
+    varying vec2 varScreenPos;
+    varying vec3 varPos;            
+
+    void main() {
+        float r = 0.02; 
+        vec2 uv = varScreenPos + r * vec2(varNormal.x, varNormal.z);
+        vec4 color = texture2D(background, uv);
+        color.z = min(color.z + 0.2, 1.0);
+
+        vec3 L = normalize(vec3(10.0, 10.0, 10.0) - varPos);   
+        float s = max(dot(varNormal, L), 0.0); 
+        color *= (0.5 + 0.5 * s);
+        
+        gl_FragColor = color;
+    }
+</script>
+
+<script>
+    // ------------------------------------------------------------------
+    // Physics Scene Configuration
+    const gPhysicsScene = {
+        gravity: new THREE.Vector3(0.0, -10.0, 0.0),
+        dt: 1.0 / 60.0,
+        riverSize: { x: 5.0, y: 1.0, z: 40.0 },
+        riverBankWidth: 1.0,
+        waterHeight: 0.8,
+        waterSpacing: 0.05,
+        paused: false,
+        waterSurface: null,
+        ball: null
+    };
+
+    // Globals
+    let gThreeScene;
+    let gRenderer;
+    let gRenderTarget;
+    let gCamera;
+    let gCameraControl;
+    let gWaterMaterial; 
+    let gPrevTime = performance.now();
+
+    const keyState = {
+        forward: false,
+        backward: false,
+        left: false,
+        right: false
+    };
+
+    const warningElement = document.getElementById('warning');
+
+    // Scratch vectors for reuse
+    const _scratchDir = new THREE.Vector3();
+
+    // ------------------------------------------------------------------
+    class WaterSurface {
+        constructor(sizeX, sizeZ, depth, spacing, visMaterial, renderer) {
+            this.waveSpeed = 2.0;
+            this.posDamping = 1.0;
+            this.velDamping = 0.3;
+            this.alpha = 0.5;
+            this.time = 0.0;
+            this.waveAmplitude = 0.01;   // Newly defined to avoid reference errors
+            this.waveFrequency = 2.0;    // Newly defined as well
+
+            this.spacing = spacing;
+            const numX = Math.floor(sizeX / spacing) + 1;
+            const numZ = Math.floor(sizeZ / spacing) + 1;
+            this.numX = numX;
+            this.numZ = numZ;
+            this.numCells = numX * numZ;
+
+            // Check for 32-bit indices support
+            this.supportsUint32 = renderer.capabilities.isWebGL2 || 
+                                    renderer.extensions.get('OES_element_index_uint');
+
+            this.numVertices = this.numCells;
+            this.numIndices = (numX - 1) * (numZ - 1) * 6;
+
+            if (!this.supportsUint32 && this.numVertices > 65535) {
+                console.warn(`WaterSurface: Number of vertices (${this.numVertices}) exceeds Uint16Array limit.`);
+                warningElement.style.display = 'block';
+                throw new Error('WaterSurface: Exceeds maximum number of vertices for Uint16Array.');
+            }
+
+            this.heights = new Float32Array(this.numCells);
+            this.bodyHeights = new Float32Array(this.numCells);
+            this.prevHeights = new Float32Array(this.numCells);
+            this.velocities = new Float32Array(this.numCells);        
+            this.heights.fill(depth);
+            this.velocities.fill(0.0);
+
+            // Setup geometry and attributes
+            const positions = new Float32Array(this.numCells * 3);
+            const uvs = new Float32Array(this.numCells * 2);
+            const cx = Math.floor(numX / 2);
+            const cz = Math.floor(numZ / 2);
+
+            for (let i = 0; i < numX; i++) {
+                for (let j = 0; j < numZ; j++) {
+                    const baseIdx = i * numZ + j;
+                    positions[3 * baseIdx] = (i - cx) * spacing; 
+                    positions[3 * baseIdx + 1] = depth;
+                    positions[3 * baseIdx + 2] = (j - cz) * spacing;
+
+                    uvs[2 * baseIdx] = i / (numX - 1);
+                    uvs[2 * baseIdx + 1] = j / (numZ - 1);
+                }
+            }
+
+            let indexArr = this.supportsUint32 
+                ? new Uint32Array(this.numIndices)
+                : new Uint16Array(this.numIndices);
+
+            let posIdx = 0;
+            for (let i = 0; i < numX - 1; i++) {
+                for (let j = 0; j < numZ - 1; j++) {
+                    const id0 = i * numZ + j;
+                    const id1 = id0 + 1;
+                    const id2 = (i + 1) * numZ + j + 1;
+                    const id3 = (i + 1) * numZ + j;
+
+                    indexArr[posIdx++] = id0;
+                    indexArr[posIdx++] = id1;
+                    indexArr[posIdx++] = id2;
+                    indexArr[posIdx++] = id0;
+                    indexArr[posIdx++] = id2;
+                    indexArr[posIdx++] = id3;
+                }
+            }
+
+            const geometry = new THREE.BufferGeometry();
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+            geometry.setIndex(new THREE.BufferAttribute(indexArr, 1));
+
+            this.visMesh = new THREE.Mesh(geometry, visMaterial);
+            this.updateVisMesh();
+            gThreeScene.add(this.visMesh);
+        }
+
+        simulateCoupling() {
+            const ball = gPhysicsScene.ball;
+            const cx = Math.floor(this.numX / 2);
+            const cz = Math.floor(this.numZ / 2);
+            const h1 = 1.0 / this.spacing;
+            const numZ = this.numZ;
+            const prevHeights = this.prevHeights;
+            const bodyHeights = this.bodyHeights;
+            const heights = this.heights;
+
+            prevHeights.set(bodyHeights);
+            bodyHeights.fill(0.0);
+
+            const posX = ball.pos.x;
+            const posZ = ball.pos.z;
+            const posY = ball.pos.y;
+            const br = ball.radius;
+            const br2 = br * br;
+
+            const x0 = Math.max(0, cx + Math.floor((posX - br) * h1));
+            const x1 = Math.min(this.numX - 1, cx + Math.floor((posX + br) * h1));
+            const z0 = Math.max(0, cz + Math.floor((posZ - br) * h1));
+            const z1 = Math.min(this.numZ - 1, cz + Math.floor((posZ + br) * h1));
+            const h2 = this.spacing * this.spacing;
+
+            for (let xi = x0; xi <= x1; xi++) {
+                const xiBase = xi * numZ;
+                const x = (xi - cx) * this.spacing;
+                const dx = posX - x;
+
+                for (let zi = z0; zi <= z1; zi++) {
+                    const z = (zi - cz) * this.spacing;
+                    const dz = posZ - z;
+                    const r2 = dx * dx + dz * dz;
+
+                    if (r2 < br2) {
+                        const bodyHalfHeight = Math.sqrt(br2 - r2);
+                        const wHeight = heights[xiBase + zi];
+                        const bodyMin = Math.max(posY - bodyHalfHeight, 0.0);
+                        const bodyMax = Math.min(posY + bodyHalfHeight, wHeight);
+                        const bodyHeight = Math.max(bodyMax - bodyMin, 0.0);
+
+                        if (bodyHeight > 0.0) {
+                            // Apply buoyant force
+                            const force = -bodyHeight * h2 * gPhysicsScene.gravity.y;
+                            ball.applyForce(new THREE.Vector3(0, force, 0));
+                            bodyHeights[xiBase + zi] += bodyHeight;
+                        }
+                    }
+                }
+            }
+
+            // Smooth bodyHeights using a temporary buffer
+            for (let iter = 0; iter < 2; iter++) {
+                const temp = new Float32Array(this.numCells);
+                for (let xi = 0; xi < this.numX; xi++) {
+                    const xiBase = xi * numZ;
+                    for (let zi = 0; zi < this.numZ; zi++) {
+                        const id = xiBase + zi;
+                        let sum = 0.0;
+                        let count = 0;
+
+                        if (xi > 0)           { sum += bodyHeights[id - numZ]; count++; }
+                        if (xi < this.numX-1) { sum += bodyHeights[id + numZ]; count++; }
+                        if (zi > 0)           { sum += bodyHeights[id - 1];     count++; }
+                        if (zi < this.numZ-1) { sum += bodyHeights[id + 1];     count++; }
+
+                        temp[id] = (count > 0) ? sum / count : bodyHeights[id];
+                    }
+                }
+                bodyHeights.set(temp);
+            }
+
+            const alpha = this.alpha;
+            for (let i = 0, nc = this.numCells; i < nc; i++) {
+                const bodyChange = bodyHeights[i] - prevHeights[i];
+                heights[i] += alpha * bodyChange;
+            }
+        }
+
+        simulateSurface() {
+            const dt = gPhysicsScene.dt;
+            this.waveSpeed = Math.min(this.waveSpeed, 0.5 * this.spacing / dt);
+            const c = (this.waveSpeed * this.waveSpeed) / (this.spacing * this.spacing);
+            const pd = Math.min(this.posDamping * dt, 1.0);
+            const vd = Math.max(0.0, 1.0 - this.velDamping * dt);
+
+            const nX = this.numX;
+            const nZ = this.numZ;
+            const h = this.heights;
+            const v = this.velocities;
+
+            for (let i = 0; i < nX; i++) {
+                const iBase = i * nZ;
+                for (let j = 0; j < nZ; j++) {
+                    const id = iBase + j;
+                    const baseH = h[id];
+                    let sumH = 0.0;
+
+                    // Mirror boundaries
+                    sumH += (i > 0)         ? h[id - nZ] : baseH;
+                    sumH += (i < nX - 1)    ? h[id + nZ] : baseH;
+                    sumH += (j > 0)         ? h[id - 1]  : baseH;
+                    sumH += (j < nZ - 1)    ? h[id + 1]  : baseH;
+
+                    v[id] += dt * c * (sumH - 4.0 * baseH);
+                    h[id] += (0.25 * sumH - baseH) * pd;
+                }
+            }
+
+            for (let i = 0, nc = this.numCells; i < nc; i++) {
+                v[i] *= vd;
+                h[i] += v[i] * dt;
+            }
+
+            // Add wave source at j=0 to create directional waves
+            for (let i = 0; i < this.numX; i++) {
+                const id = i * this.numZ + 0; // j=0
+                h[id] += this.waveAmplitude * Math.sin(this.time * this.waveFrequency);
+            }
+        }
+
+        simulate() {
+            this.time += gPhysicsScene.dt;
+            this.simulateCoupling();
+            this.simulateSurface();
+            this.updateVisMesh();
+        }
+
+        updateVisMesh() {
+            const posAttr = this.visMesh.geometry.attributes.position;
+            const positions = posAttr.array;
+            const h = this.heights;
+            for (let i = 0, nc = this.numCells; i < nc; i++) {
+                positions[3 * i + 1] = h[i];
+            }
+            posAttr.needsUpdate = true;
+            // Computing vertex normals every frame is expensive. Consider a more optimal approach if needed.
+            this.visMesh.geometry.computeVertexNormals();
+        }
+
+        setVisible(visible) {
+            this.visMesh.visible = visible;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    class Ball {
+        constructor(pos, radius, density, color = 0xff0000) {
+            this.pos = new THREE.Vector3(pos.x, pos.y, pos.z);
+            this.radius = radius;
+            this.mass = (4.0 * Math.PI / 3.0) * Math.pow(radius, 3) * density;
+            this.vel = new THREE.Vector3(0.0, 0.0, 0.0);
+            this.grabbed = false;
+            this.restitution = 0.8;
+
+            const geometry = new THREE.SphereGeometry(radius, 32, 32);
+            const material = new THREE.MeshPhongMaterial({color: color});
+            this.visMesh = new THREE.Mesh(geometry, material);
+            this.visMesh.position.copy(this.pos);
+            gThreeScene.add(this.visMesh);
+        }
+
+        simulate() {
+            if (this.grabbed) return;
+
+            // Apply gravity
+            this.vel.addScaledVector(gPhysicsScene.gravity, gPhysicsScene.dt);
+            // Update position based on velocity
+            this.pos.addScaledVector(this.vel, gPhysicsScene.dt);
+
+            const riverHalfWidth = gPhysicsScene.riverSize.x / 2;
+
+            // Collision with riverbanks (X-direction)
+            if (this.pos.x < -riverHalfWidth) {
+                this.pos.x = -riverHalfWidth;
+                this.vel.x = -this.restitution * this.vel.x;
+            } else if (this.pos.x > riverHalfWidth) {
+                this.pos.x = riverHalfWidth;
+                this.vel.x = -this.restitution * this.vel.x;
+            }
+
+            // Collision with the ground (Y-direction)
+            if (this.pos.y < this.radius) {
+                this.pos.y = this.radius;
+                this.vel.y = -this.restitution * this.vel.y;
+            }
+
+            // Update the mesh position
+            this.visMesh.position.copy(this.pos);
+        }
+
+        moveLeft() {
+            this.vel.x -= gPhysicsScene.dt * 14.0;
+        }
+
+        moveRight() {
+            this.vel.x += gPhysicsScene.dt * 14.0;
+        }
+
+        moveForward() {
+            this.vel.z -= gPhysicsScene.dt * 14.0;
+        }
+
+        moveBackward() {
+            this.vel.z += gPhysicsScene.dt * 14.0;
+        }
+
+        applyForce(force) {
+            // Force affects velocity directly
+            this.vel.add(force.clone().multiplyScalar(gPhysicsScene.dt / this.mass));
+            this.vel.multiplyScalar(0.999); // Slight damping
+        }  
+    }   
+
+    function initScene() {
+        const { riverSize, riverBankWidth, waterHeight, waterSpacing } = gPhysicsScene;
+        const { x: riverWidth, y: riverHeight, z: riverLength } = riverSize;
+        const riverHalfWidth = riverWidth / 2;
+
+        // Create Water Surface
+        try {
+            gPhysicsScene.waterSurface = new WaterSurface(
+                riverWidth, riverLength, waterHeight, waterSpacing, gWaterMaterial, gRenderer
+            );
+        } catch (error) {
+            console.error(error);
+            return;
+        }
+
+        // Create Riverbanks
+        const riverBankMaterial = new THREE.MeshPhongMaterial({ color: 0x8B4513 });
+        const groundMaterial = new THREE.MeshPhongMaterial({ color: 0x228B00, shininess: 100 });
+
+        const createBank = (xPos) => {
+            const bankGeometry = new THREE.BoxGeometry(riverBankWidth, riverHeight + 1.0, riverLength + 2.0);
+            const bank = new THREE.Mesh(bankGeometry, riverBankMaterial);
+            bank.position.set(xPos, (riverHeight + 1.0) / 2, 0.0);
+            bank.castShadow = true;
+            bank.receiveShadow = true;
+            gThreeScene.add(bank);
+        };
+
+        const createGround = (xPos) => {
+            const groundGeometry = new THREE.PlaneGeometry(10, riverLength + 1.0, 1, 1);
+            const ground = new THREE.Mesh(groundGeometry, groundMaterial);
+            ground.rotation.x = -Math.PI / 2;
+            ground.position.set(xPos, (riverHeight + 2.0) / 1.5, 0.0);
+            ground.receiveShadow = true;
+            gThreeScene.add(ground);
+        };
+
+        createBank(-riverHalfWidth - riverBankWidth / 2);
+        createBank(riverHalfWidth + riverBankWidth / 2);
+        createGround(-riverHalfWidth - riverBankWidth - 5);
+        createGround(riverHalfWidth + riverBankWidth + 5);
+
+        // Single Ball in the River
+        gPhysicsScene.ball = new Ball({ x: 0.0, y: waterHeight + 0.3, z: 0.0 }, 0.3, 0.8, 0xff8000);
+    }
+
+    function simulate() {
+        if (gPhysicsScene.paused) return;
+        gPhysicsScene.waterSurface.simulate();
+        gPhysicsScene.ball.simulate();
+    }
+
+    function render() {
+        // Render scene without water surface to render target
+        gPhysicsScene.waterSurface.setVisible(false);
+        gRenderer.setRenderTarget(gRenderTarget);
+        gRenderer.clear();
+        gRenderer.render(gThreeScene, gCamera);
+
+        // Render with water surface and shader
+        gPhysicsScene.waterSurface.setVisible(true);
+        gRenderer.setRenderTarget(null);
+        gRenderer.render(gThreeScene, gCamera);
+    }
+
+    let container;
+    function initThreeScene() {
+        container = document.getElementById('container');
+        gThreeScene = new THREE.Scene();
+        
+        // Lighting
+        gThreeScene.add(new THREE.AmbientLight(0x505050));
+
+        const spotLight = new THREE.SpotLight(0xffffff);
+        spotLight.angle = Math.PI / 5;
+        spotLight.penumbra = 0.2;
+        spotLight.position.set(10, 40, 10);
+        spotLight.castShadow = true;
+        spotLight.shadow.camera.near = 1;
+        spotLight.shadow.camera.far = 50;
+        spotLight.shadow.mapSize.set(2048, 2048);
+        gThreeScene.add(spotLight);
+
+        // Riverbed
+        const riverbedMaterial = new THREE.MeshPhongMaterial({ color: 0x228Baa, shininess: 100 });
+        const riverbedGeometry = new THREE.PlaneGeometry(
+            gPhysicsScene.riverSize.x + gPhysicsScene.riverBankWidth * 2,
+            gPhysicsScene.riverSize.z + 4.0
+        );
+        const riverbed = new THREE.Mesh(riverbedGeometry, riverbedMaterial);
+        riverbed.rotation.x = -Math.PI / 2;
+        riverbed.position.y = 0.0;
+        riverbed.receiveShadow = true;
+        gThreeScene.add(riverbed);
+
+        // Renderer
+        gRenderer = new THREE.WebGLRenderer({antialias: true});
+        gRenderer.setClearColor(0x87ceeb);
+        gRenderer.shadowMap.enabled = true;
+        gRenderer.setPixelRatio(window.devicePixelRatio);
+        gRenderer.setSize(window.innerWidth, window.innerHeight);
+        window.addEventListener('resize', onWindowResize, false);
+        container.appendChild(gRenderer.domElement);
+
+        // Render Target
+        gRenderTarget = new THREE.WebGLRenderTarget(window.innerWidth, window.innerHeight, {
+            minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, format: THREE.RGBAFormat 
+        });
+
+        // Water Material
+        gWaterMaterial = new THREE.ShaderMaterial({
+            uniforms: { background: { value: gRenderTarget.texture } },
+            vertexShader: document.getElementById('waterVertexShader').textContent,
+            fragmentShader: document.getElementById('waterFragmentShader').textContent,
+            side: THREE.DoubleSide,
+            transparent: true
+        });
+            
+        // Camera
+        gCamera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+        gCamera.position.set(0.0, 10.0, 25.0);
+        gCamera.lookAt(new THREE.Vector3(0, 0.8, 0));
+        gThreeScene.add(gCamera);
+
+        // Controls
+        gCameraControl = new THREE.OrbitControls(gCamera, gRenderer.domElement);
+        gCameraControl.zoomSpeed = 2.0;
+        gCameraControl.panSpeed = 0.4;
+        gCameraControl.target.set(0.0, 0.8, 0.0);
+        gCameraControl.update();
+
+        // Input events
+        window.addEventListener('keydown', handleKeyEvent, false);
+        window.addEventListener('keyup', handleKeyEvent, false);
+    }
+
+    function handleKeyEvent(evt) {
+        const isKeyDown = (evt.type === 'keydown');
+        switch(evt.key.toLowerCase()) {
+            case 'w': keyState.forward = isKeyDown; break;
+            case 's': keyState.backward = isKeyDown; break;
+            case 'a': keyState.left = isKeyDown; break;
+            case 'd': keyState.right = isKeyDown; break;
+        }
+    }
+
+    function onWindowResize() {
+        gCamera.aspect = window.innerWidth / window.innerHeight;
+        gCamera.updateProjectionMatrix();
+        gRenderer.setSize(window.innerWidth, window.innerHeight);
+        gRenderTarget.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    function toggleRun() {
+        const button = document.getElementById('buttonRun');
+        gPhysicsScene.paused = !gPhysicsScene.paused;
+        button.innerHTML = gPhysicsScene.paused ? "Run" : "Stop";
+    }
+
+    function restart() {
+        location.reload();
+    }
+
+    function update() {
+        const currentTime = performance.now();
+        const delta = (currentTime - gPrevTime) / 1000.0;
+        gPrevTime = currentTime;
+
+        gPhysicsScene.dt = Math.min(1.0 / 30.0, delta);
+
+        if (!gPhysicsScene.paused) {
+            if (keyState.forward) gPhysicsScene.ball.moveForward();
+            if (keyState.backward) gPhysicsScene.ball.moveBackward();
+            if (keyState.left) gPhysicsScene.ball.moveLeft();
+            if (keyState.right) gPhysicsScene.ball.moveRight();
+        }
+
+        simulate();
+        render();
+        gCameraControl.update();
+
+        requestAnimationFrame(update);
+    }
+    
+    // Initialize and start
+    initThreeScene();
+    initScene();
+    update();
+</script>
+</body>
+</html>

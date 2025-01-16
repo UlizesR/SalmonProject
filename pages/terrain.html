@@ -1,0 +1,643 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Height Map Terrain with Waves</title>
+    <style>
+        body { margin: 0; overflow: hidden; }
+        canvas { display: block; }
+        button {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            z-index: 10;
+        }
+        #save {
+            top: 50px;
+        }
+        #upload {
+            top: 100px;
+        }
+        #fileInput {
+            display: none;
+        }
+    </style>
+    <script src="https://unpkg.com/three@0.139.2/build/three.min.js"></script>
+    <script src="https://unpkg.com/three@0.139.2/examples/js/controls/OrbitControls.js"></script>
+
+    <!-- Water Shaders -->
+    <script id="waterVertexShader" type="x-shader/x-vertex">
+        varying vec3 varNormal;
+        varying vec2 varScreenPos;
+        varying vec3 varPos;
+
+        void main() {
+            vec4 pos = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+            gl_Position = pos;
+            varScreenPos = (gl_Position.xy / gl_Position.w) * 0.5 + vec2(0.5);
+            varPos = position;
+            varNormal = normal;
+        }
+    </script>
+
+    <script id="waterFragmentShader" type="x-shader/x-fragment">
+        uniform sampler2D background;
+        varying vec3 varNormal;
+        varying vec2 varScreenPos;
+        varying vec3 varPos;            
+
+        void main() {
+            float r = 0.02; 
+            vec2 uv = varScreenPos + r * vec2(varNormal.x, varNormal.z);
+            vec4 color = texture2D(background, uv);
+            color.z = min(color.z + 0.2, 1.0);
+
+            vec3 L = normalize(vec3(10.0, 10.0, 10.0) - varPos);   
+            float s = max(dot(varNormal, L), 0.0); 
+            color *= (0.5 + 0.5 * s);
+         
+            gl_FragColor = color;
+        }
+    </script>
+</head>
+<body>
+    <button id="regenerate">Regenerate Terrain</button>
+    <button id="save">Save Map</button>
+    <button id="upload">Upload JSON</button>
+    <input type="file" id="fileInput" accept=".json">
+    <div id="container"></div>
+
+    <script type="module">
+        // ------------------------------------------------------
+        // Terrain Configuration
+        // ------------------------------------------------------
+        const N = 8;
+        const MATRIX_LENGTH = Math.pow(2, N) + 1; 
+        const SEGMENTS = MATRIX_LENGTH - 1;        
+        const RANDOM_INITIAL_RANGE = 5;
+
+        const TERRAIN_WIDTH = 512;
+        const TERRAIN_HEIGHT = 512;
+        const AMPLITUDE = 50;    
+        const SMOOTH_ITERATIONS = 10; 
+        const FLATTEN_THRESHOLD = 0.3;
+
+        class TerrainType {
+            constructor(minHeight, maxHeight, minColor, maxColor, lerpAdjustment = 0) {
+                this.minHeight = minHeight;
+                this.maxHeight = maxHeight;
+                this.minColor = minColor;
+                this.maxColor = maxColor;
+                this.lerpAdjustment = lerpAdjustment;
+            }
+        }
+
+        function rgbToArray(r, g, b) {
+            return [r / 255, g / 255, b / 255];
+        }
+
+        const terrainTypes = [
+            new TerrainType(0.2, 0.4, rgbToArray(30,176,251), rgbToArray(40,255,255)),         // Water
+            new TerrainType(0.4, 0.5, rgbToArray(215,192,158), rgbToArray(255,246,193), 0.3), // Sand
+            new TerrainType(0.5, 0.7, rgbToArray(2,166,155), rgbToArray(118,239,124)),        // Grass
+            new TerrainType(0.7, 0.75, rgbToArray(22,181,141), rgbToArray(10,145,113), -0.5)  // Trees
+        ];
+
+        function getTerrainColor(noiseValue) {
+            for (const type of terrainTypes) {
+                if (noiseValue < type.maxHeight) {
+                    return blendTerrainColor(noiseValue, type);
+                }
+            }
+            return blendTerrainColor(noiseValue, terrainTypes[terrainTypes.length - 1]);
+        }
+
+        function blendTerrainColor(noiseValue, mapType) {
+            const t = THREE.MathUtils.clamp(
+                normalize(noiseValue, mapType.maxHeight, mapType.minHeight) + mapType.lerpAdjustment,
+                0, 1
+            );
+            return lerpColor(mapType.minColor, mapType.maxColor, t);
+        }
+
+        function normalize(value, max, min) {
+            if (value > max) return 1;
+            if (value < min) return 0;
+            return (value - min) / (max - min);
+        }
+
+        function lerpColor(c1, c2, t) {
+            return [
+                c1[0] + (c2[0] - c1[0]) * t,
+                c1[1] + (c2[1] - c1[1]) * t,
+                c1[2] + (c2[2] - c1[2]) * t
+            ];
+        }
+
+        // Diamond-square
+        function randomInRange(min, max) {
+            return Math.floor(Math.random() * (max - min + 1) + min);
+        }
+
+        function generateMatrix() {
+            const matrix = Array.from({ length: MATRIX_LENGTH }, () => Array(MATRIX_LENGTH).fill(null));
+            matrix[0][0] = randomInRange(0, RANDOM_INITIAL_RANGE);
+            matrix[0][MATRIX_LENGTH - 1] = randomInRange(0, RANDOM_INITIAL_RANGE);
+            matrix[MATRIX_LENGTH - 1][0] = randomInRange(0, RANDOM_INITIAL_RANGE);
+            matrix[MATRIX_LENGTH - 1][MATRIX_LENGTH - 1] = randomInRange(0, RANDOM_INITIAL_RANGE);
+            return matrix;
+        }
+
+        function calculateSquare(matrix, chunkSize, randomFactor) {
+            for (let x = 0; x < matrix.length - 1; x += chunkSize) {
+                for (let y = 0; y < matrix.length - 1; y += chunkSize) {
+                    const bottomRight = matrix[y + chunkSize]?.[x + chunkSize];
+                    const bottomLeft = matrix[y + chunkSize]?.[x];
+                    const topLeft = matrix[y][x];
+                    const topRight = matrix[y][x + chunkSize];
+
+                    const { count, sum } = [bottomRight, bottomLeft, topLeft, topRight].reduce(
+                        (acc, val) => {
+                            if (val != null && isFinite(val)) {
+                                acc.sum += val;
+                                acc.count++;
+                            }
+                            return acc;
+                        },
+                        { sum: 0, count: 0 }
+                    );
+
+                    matrix[y + chunkSize/2][x + chunkSize/2] = (sum / count) + randomInRange(-randomFactor, randomFactor);
+                }
+            }
+        }
+
+        function calculateDiamond(matrix, chunkSize, randomFactor) {
+            const half = chunkSize / 2;
+            for (let y = 0; y < matrix.length; y += half) {
+                for (let x = (y + half) % chunkSize; x < matrix.length; x += chunkSize) {
+                    const bottom = matrix[y + half]?.[x];
+                    const left = matrix[y][x - half];
+                    const top = matrix[y - half]?.[x];
+                    const right = matrix[y][x + half];
+
+                    const { count, sum } = [bottom, left, top, right].reduce(
+                        (acc, val) => {
+                            if (val != null && isFinite(val)) {
+                                acc.sum += val;
+                                acc.count++;
+                            }
+                            return acc;
+                        },
+                        { sum: 0, count: 0 }
+                    );
+                    matrix[y][x] = (sum / count) + randomInRange(-randomFactor, randomFactor);
+                }
+            }
+        }
+
+        function diamondSquare(matrix) {
+            let chunkSize = MATRIX_LENGTH - 1;
+            let randomFactor = RANDOM_INITIAL_RANGE;
+
+            while (chunkSize > 1) {
+                calculateSquare(matrix, chunkSize, randomFactor);
+                calculateDiamond(matrix, chunkSize, randomFactor);
+                chunkSize /= 2;
+                randomFactor /= 2.5;
+            }
+            return matrix;
+        }
+
+        function normalizeMatrix(matrix) {
+            let maxValue = -Infinity;
+            for (const row of matrix) {
+                for (const val of row) {
+                    if (val > maxValue) maxValue = val;
+                }
+            }
+            const scale = 1 / maxValue;
+            return matrix.map(row => row.map(val => val * scale));
+        }
+
+        function flattenMatrix(matrix, threshold) {
+            for (let i = 0; i < matrix.length; i++) {
+                for (let j = 0; j < matrix.length; j++) {
+                    if (matrix[i][j] < threshold) {
+                        matrix[i][j] = threshold;
+                    }
+                }
+            }
+            return matrix;
+        }
+
+        function smoothMatrix(matrix, iterations = 1) {
+            const len = matrix.length;
+            for (let iter = 0; iter < iterations; iter++) {
+                const tempMatrix = matrix.map(row => [...row]);
+                for (let i = 1; i < len - 1; i++) {
+                    for (let j = 1; j < len - 1; j++) {
+                        tempMatrix[i][j] = (
+                            matrix[i][j] +
+                            matrix[i - 1][j] +
+                            matrix[i + 1][j] +
+                            matrix[i][j - 1] +
+                            matrix[i][j + 1]
+                        ) / 5;
+                    }
+                }
+                matrix = tempMatrix;
+            }
+            return matrix;
+        }
+
+        function smoothEdges(matrix, iterations = 1) {
+            const len = matrix.length;
+            for (let iter = 0; iter < iterations; iter++) {
+                const tempMatrix = matrix.map(row => [...row]);
+                for (let i = 0; i < len; i++) {
+                    for (let j = 0; j < len; j++) {
+                        if (i === 0 || i === len - 1 || j === 0 || j === len - 1) {
+                            tempMatrix[i][j] = (
+                                matrix[i][j] +
+                                (matrix[i - 1]?.[j] || matrix[i][j]) +
+                                (matrix[i + 1]?.[j] || matrix[i][j]) +
+                                (matrix[i][j - 1] || matrix[i][j]) +
+                                (matrix[i][j + 1] || matrix[i][j])
+                            ) / 5;
+                        }
+                    }
+                }
+                matrix = tempMatrix;
+            }
+            return matrix;
+        }
+
+        // Scene Setup
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x87ceeb);
+
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 2000);
+        camera.position.set(0, 300, 600);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.getElementById('container').appendChild(renderer.domElement);
+
+        const controls = new THREE.OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.minDistance = 10;
+        controls.maxDistance = 2000;
+        controls.maxPolarAngle = Math.PI / 2 - 0.05;
+
+        // Lights
+        scene.add(new THREE.AmbientLight(0xffffff, 0.4));
+        const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        directionalLight.position.set(100, 300, 100);
+        scene.add(directionalLight);
+
+        let terrain = null;
+        let matrix = null;
+
+        // Physics/Water scene config
+        const gPhysicsScene = {
+            dt: 1.0 / 60.0,
+            riverSize: { x: TERRAIN_WIDTH, y: 1.0, z: TERRAIN_HEIGHT },
+            waterSpacing: 1.0,
+            paused: false,
+            waterSurface: null
+        };
+
+        let gRenderTarget, gWaterMaterial;
+
+        class WaterSurface {
+            constructor(sizeX, sizeZ, depth, spacing, visMaterial, renderer) {
+                this.waveSpeed = 2.0;
+                this.posDamping = 1.0;
+                this.velDamping = 0.3;
+                this.alpha = 0.5;
+                this.time = 0.0;
+                this.waveAmplitude = 0.01;
+                this.waveFrequency = 2.0;
+
+                this.spacing = spacing;
+                const numX = Math.floor(sizeX / spacing) + 1;
+                const numZ = Math.floor(sizeZ / spacing) + 1;
+                this.numX = numX;
+                this.numZ = numZ;
+                this.numCells = numX * numZ;
+
+                this.supportsUint32 = renderer.capabilities.isWebGL2 || 
+                                      renderer.extensions.get('OES_element_index_uint');
+
+                this.heights = new Float32Array(this.numCells);
+                this.velocities = new Float32Array(this.numCells);        
+                this.heights.fill(depth);
+                this.velocities.fill(0.0);
+
+                const positions = new Float32Array(this.numCells * 3);
+                const uvs = new Float32Array(this.numCells * 2);
+                const cx = Math.floor(numX / 2);
+                const cz = Math.floor(numZ / 2);
+
+                for (let i = 0; i < numX; i++) {
+                    for (let j = 0; j < numZ; j++) {
+                        const baseIdx = i * numZ + j;
+                        positions[3 * baseIdx] = (i - cx) * spacing; 
+                        positions[3 * baseIdx + 1] = depth;
+                        positions[3 * baseIdx + 2] = (j - cz) * spacing;
+                        uvs[2 * baseIdx] = i / (numX - 1);
+                        uvs[2 * baseIdx + 1] = j / (numZ - 1);
+                    }
+                }
+
+                const numIndices = (numX - 1) * (numZ - 1) * 6;
+                let indexArr = this.supportsUint32 ? new Uint32Array(numIndices) : new Uint16Array(numIndices);
+
+                let posIdx = 0;
+                for (let i = 0; i < numX - 1; i++) {
+                    for (let j = 0; j < numZ - 1; j++) {
+                        const id0 = i * numZ + j;
+                        const id1 = id0 + 1;
+                        const id2 = (i + 1) * numZ + j + 1;
+                        const id3 = (i + 1) * numZ + j;
+
+                        indexArr[posIdx++] = id0;
+                        indexArr[posIdx++] = id1;
+                        indexArr[posIdx++] = id2;
+                        indexArr[posIdx++] = id0;
+                        indexArr[posIdx++] = id2;
+                        indexArr[posIdx++] = id3;
+                    }
+                }
+
+                const geometry = new THREE.BufferGeometry();
+                geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+                geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+                geometry.setIndex(new THREE.BufferAttribute(indexArr, 1));
+
+                this.visMesh = new THREE.Mesh(geometry, visMaterial);
+                scene.add(this.visMesh);
+                this.updateVisMesh();
+            }
+
+            simulateSurface() {
+                const dt = gPhysicsScene.dt;
+                this.waveSpeed = Math.min(this.waveSpeed, 0.5 * this.spacing / dt);
+                const c = (this.waveSpeed * this.waveSpeed) / (this.spacing * this.spacing);
+                const pd = Math.min(this.posDamping * dt, 1.0);
+                const vd = Math.max(0.0, 1.0 - this.velDamping * dt);
+
+                const nX = this.numX;
+                const nZ = this.numZ;
+                const h = this.heights;
+                const v = this.velocities;
+
+                for (let i = 0; i < nX; i++) {
+                    const iBase = i * nZ;
+                    for (let j = 0; j < nZ; j++) {
+                        const id = iBase + j;
+                        const baseH = h[id];
+                        let sumH = 0.0;
+
+                        sumH += (i > 0) ? h[id - nZ] : baseH;
+                        sumH += (i < nX - 1) ? h[id + nZ] : baseH;
+                        sumH += (j > 0) ? h[id - 1] : baseH;
+                        sumH += (j < nZ - 1) ? h[id + 1] : baseH;
+
+                        v[id] += dt * c * (sumH - 4.0 * baseH);
+                        h[id] += (0.25 * sumH - baseH) * pd;
+                    }
+                }
+
+                for (let i = 0, nc = this.numCells; i < nc; i++) {
+                    v[i] *= vd;
+                    h[i] += v[i] * dt;
+                }
+
+                // Generate waves along one edge
+                for (let i = 0; i < this.numX; i++) {
+                    const id = i * this.numZ;
+                    h[id] += this.waveAmplitude * Math.sin(this.time * this.waveFrequency);
+                }
+            }
+
+            simulate() {
+                this.time += gPhysicsScene.dt;
+                // Only wave simulation now
+                this.simulateSurface();
+                this.updateVisMesh();
+            }
+
+            updateVisMesh() {
+                const posAttr = this.visMesh.geometry.attributes.position;
+                const positions = posAttr.array;
+                const h = this.heights;
+                for (let i = 0, nc = this.numCells; i < nc; i++) {
+                    positions[3 * i + 1] = h[i];
+                }
+                posAttr.needsUpdate = true;
+                this.visMesh.geometry.computeVertexNormals();
+            }
+
+            setVisible(visible) {
+                this.visMesh.visible = visible;
+            }
+        }
+
+        function applyHeightMap(geometry, normalizedMatrix) {
+            const vertices = geometry.attributes.position.array;
+            const stride = SEGMENTS + 1;
+
+            for (let i = 0; i <= SEGMENTS; i++) {
+                for (let j = 0; j <= SEGMENTS; j++) {
+                    const index = (i * stride + j) * 3;
+                    const yValue = normalizedMatrix[i][j];
+                    vertices[index + 1] = (yValue - 0.5) * 2 * AMPLITUDE;
+                }
+            }
+
+            geometry.attributes.position.needsUpdate = true;
+            geometry.computeVertexNormals();
+        }
+
+        function applyVertexColors(geometry, normalizedMatrix) {
+            const colors = [];
+            const stride = SEGMENTS + 1;
+
+            for (let i = 0; i <= SEGMENTS; i++) {
+                for (let j = 0; j <= SEGMENTS; j++) {
+                    const yValue = normalizedMatrix[i][j];
+                    const color = getTerrainColor(yValue);
+                    colors.push(...color);
+                }
+            }
+
+            geometry.setAttribute('color', new THREE.Float32BufferAttribute(new Float32Array(colors), 3));
+        }
+
+        function saveMap() {
+            const dataStr = JSON.stringify(matrix);
+            const blob = new Blob([dataStr], { type: "application/json" });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = "terrain.json";
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+
+        function handleFileUpload(event) {
+            const file = event.target.files[0];
+            if (file) {
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    const contents = e.target.result;
+                    matrix = JSON.parse(contents);
+                    generateTerrainFromMatrix(matrix);
+                    setupPhysicsObjects();
+                };
+                reader.readAsText(file);
+            }
+        }
+
+        function generateTerrainFromMatrix(m) {
+            const normalizedMatrix = normalizeMatrix(m);
+
+            const terrainGeometry = new THREE.PlaneGeometry(
+                TERRAIN_WIDTH,
+                TERRAIN_HEIGHT,
+                SEGMENTS,
+                SEGMENTS
+            );
+            terrainGeometry.rotateX(-Math.PI / 2);
+
+            applyHeightMap(terrainGeometry, normalizedMatrix);
+            applyVertexColors(terrainGeometry, normalizedMatrix);
+
+            const terrainMaterial = new THREE.MeshStandardMaterial({
+                vertexColors: true,
+                flatShading: true,
+                metalness: 0.3,
+                roughness: 0.8
+            });
+
+            if (terrain) {
+                scene.remove(terrain);
+            }
+            terrain = new THREE.Mesh(terrainGeometry, terrainMaterial);
+            scene.add(terrain);
+        }
+
+        function generateTerrain() {
+            matrix = diamondSquare(generateMatrix());
+            matrix = flattenMatrix(matrix, FLATTEN_THRESHOLD);
+            matrix = smoothMatrix(matrix, SMOOTH_ITERATIONS);
+            matrix = smoothEdges(matrix, SMOOTH_ITERATIONS);
+
+            const normalizedMatrix = normalizeMatrix(matrix);
+
+            const terrainGeometry = new THREE.PlaneGeometry(
+                TERRAIN_WIDTH,
+                TERRAIN_HEIGHT,
+                SEGMENTS,
+                SEGMENTS
+            );
+            terrainGeometry.rotateX(-Math.PI / 2);
+
+            applyHeightMap(terrainGeometry, normalizedMatrix);
+            applyVertexColors(terrainGeometry, normalizedMatrix);
+
+            const terrainMaterial = new THREE.MeshStandardMaterial({
+                vertexColors: true,
+                flatShading: true,
+                metalness: 0.3,
+                roughness: 0.8
+            });
+
+            if (terrain) {
+                scene.remove(terrain);
+            }
+            terrain = new THREE.Mesh(terrainGeometry, terrainMaterial);
+            scene.add(terrain);
+
+            setupPhysicsObjects();
+        }
+
+        function setupPhysicsObjects() {
+            if (!gRenderTarget) {
+                gRenderTarget = new THREE.WebGLRenderTarget(window.innerWidth, window.innerHeight, {
+                    minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, format: THREE.RGBAFormat 
+                });
+
+                gWaterMaterial = new THREE.ShaderMaterial({
+                    uniforms: { background: { value: gRenderTarget.texture } },
+                    vertexShader: document.getElementById('waterVertexShader').textContent,
+                    fragmentShader: document.getElementById('waterFragmentShader').textContent,
+                    side: THREE.DoubleSide,
+                    transparent: true,
+                    opacity: 0.6
+                });
+            }
+
+            if (gPhysicsScene.waterSurface) {
+                scene.remove(gPhysicsScene.waterSurface.visMesh);
+            }
+            gPhysicsScene.waterSurface = new WaterSurface(
+                TERRAIN_WIDTH, TERRAIN_HEIGHT, 0.0, gPhysicsScene.waterSpacing, gWaterMaterial, renderer
+            );
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            if (gRenderTarget) gRenderTarget.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        window.addEventListener('resize', onWindowResize);
+        document.getElementById('regenerate').addEventListener('click', generateTerrain);
+        document.getElementById('save').addEventListener('click', saveMap);
+        document.getElementById('upload').addEventListener('click', () => document.getElementById('fileInput').click());
+        document.getElementById('fileInput').addEventListener('change', handleFileUpload);
+
+        let gPrevTime = performance.now();
+
+        function simulate() {
+            if (gPhysicsScene.paused) return;
+            if (gPhysicsScene.waterSurface) gPhysicsScene.waterSurface.simulate();
+        }
+
+        function render() {
+            if (!gRenderTarget) return;
+            if (gPhysicsScene.waterSurface) gPhysicsScene.waterSurface.setVisible(false);
+            renderer.setRenderTarget(gRenderTarget);
+            renderer.clear();
+            renderer.render(scene, camera);
+
+            if (gPhysicsScene.waterSurface) gPhysicsScene.waterSurface.setVisible(true);
+            renderer.setRenderTarget(null);
+            renderer.render(scene, camera);
+        }
+
+        function update() {
+            const currentTime = performance.now();
+            const delta = (currentTime - gPrevTime) / 1000.0;
+            gPrevTime = currentTime;
+
+            gPhysicsScene.dt = Math.min(1.0 / 30.0, delta);
+
+            simulate();
+            render();
+            controls.update();
+
+            requestAnimationFrame(update);
+        }
+
+        // Initial terrain and start
+        generateTerrain();
+        update();
+    </script>
+</body>
+</html>
